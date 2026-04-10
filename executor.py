@@ -59,7 +59,7 @@ async def call_gemini(query, model_id, api_key, history=None):
 async def call_cohere(query, model_id, api_key, history=None):
     model_name = MODELS[model_id]["api_model"]
     try:
-        messages = _build_messages(query, history)
+        messages = [m for m in _build_messages(query, history) if m.get("content", "").strip()]
         async with httpx.AsyncClient(timeout=30) as c:
             r = await c.post("https://api.cohere.com/v2/chat",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},

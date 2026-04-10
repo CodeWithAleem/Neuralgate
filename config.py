@@ -31,21 +31,21 @@ MODELS = {
         "cost": 0.0, "latency": 0.3, "quality": 0.85,
         "handles_sensitive": True, "tier": "free", "free": True,
     },
-    # --- FREE: Cohere ---
+   # --- FREE: Cohere ---
+    "cohere-command-a": {
+        "provider": "cohere",
+        "api_model": "command-a-03-2025",
+        "display": "Command A (Cohere)",
+        "key_name": "COHERE_API_KEY",
+        "cost": 0.0, "latency": 0.35, "quality": 0.90,
+        "handles_sensitive": True, "tier": "free", "free": True,
+    },
     "cohere-command-r-plus": {
         "provider": "cohere",
-        "api_model": "command-r-plus",
+        "api_model": "command-r-plus-08-2024",
         "display": "Command R+ (Cohere)",
         "key_name": "COHERE_API_KEY",
         "cost": 0.0, "latency": 0.4, "quality": 0.86,
-        "handles_sensitive": True, "tier": "free", "free": True,
-    },
-    "cohere-command-r": {
-        "provider": "cohere",
-        "api_model": "command-r",
-        "display": "Command R (Cohere)",
-        "key_name": "COHERE_API_KEY",
-        "cost": 0.0, "latency": 0.25, "quality": 0.78,
         "handles_sensitive": True, "tier": "free", "free": True,
     },
     # --- FREE CREDITS: Together AI ---
