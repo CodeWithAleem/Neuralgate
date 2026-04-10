@@ -13,7 +13,7 @@ from safety import inspect
 from router import route
 from validator import validate
 from executor import execute
-from learner import log, learn, get_learned_weights, get_recent, get_stats
+from learner import log, learn, get_learned_weights, get_recent, get_stats, save_feedback
 from config import MODELS
 import cache
 import budget
@@ -149,6 +149,16 @@ async def set_budget(limit: float = 1.0):
 async def clear_cache():
     cache.clear()
     return {"cleared": True}
+
+class FeedbackReq(BaseModel):
+    model: str
+    complexity: str = "simple"
+    vote: str  # "up" or "down"
+    query: str = ""
+
+@app.post("/feedback")
+async def submit_feedback(req: FeedbackReq):
+    return save_feedback(req.model, req.complexity, req.vote, req.query)
 
 
 UI = r"""<!DOCTYPE html>
@@ -388,7 +398,7 @@ function renderChat(){
     const costCls=m.cached?'cached':m.cost>0?'paid':'free';
     html+='<div class="msg msg-user"><div class="bubble">'+escHtml(m.user)+'</div></div>';
     html+='<div class="msg msg-ai"><div class="ai-meta"><span class="ai-model">'+escHtml(m.model)+'</span><span class="ai-time">'+m.time+'ms</span><span class="ai-cost '+costCls+'">'+costStr+'</span></div><div class="ai-bubble'+(m.cached?' cache-hit':'')+'">'+escHtml(m.ai)+'</div>';
-    html+='<div class="ai-actions"><button class="thumb" id="up-'+mid+'" onclick="feedback(\''+mid+'\',\'up\')">&#128077;</button><button class="thumb" id="dn-'+mid+'" onclick="feedback(\''+mid+'\',\'down\')">&#128078;</button>';
+    html+='<div class="ai-actions"><button class="thumb" id="up-'+mid+'" onclick="feedback(\''+mid+'\',\'up\',\''+escHtml(m.model_id||m.model)+'\',\''+escHtml(m.complexity||'simple')+'\',\''+escHtml(m.user).replace(/'/g,'')+'\')">&#128077;</button><button class="thumb" id="dn-'+mid+'" onclick="feedback(\''+mid+'\',\'down\',\''+escHtml(m.model_id||m.model)+'\',\''+escHtml(m.complexity||'simple')+'\',\''+escHtml(m.user).replace(/'/g,'')+'\')">&#128078;</button>';
     if(m.details)html+='<button class="dbtn" onclick="toggleDet(\''+mid+'\')">Details</button>';
     html+='</div>';
     if(m.details)html+='<div class="dpop" id="det-'+mid+'">'+m.details+'</div>';
@@ -404,7 +414,17 @@ function toggleS(){document.getElementById('settings').classList.toggle('open');
 function escHtml(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
 function showToast(msg,type){const t=document.getElementById('toast');t.textContent=msg;t.className='toast show '+type;setTimeout(()=>t.classList.remove('show'),2500)}
 function autoResize(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,120)+'px'}
-function feedback(id,type){const up=document.getElementById('up-'+id),dn=document.getElementById('dn-'+id);if(!up||!dn)return;if(type==='up'){up.classList.toggle('up-active');dn.classList.remove('down-active')}else{dn.classList.toggle('down-active');up.classList.remove('up-active')}}
+function feedback(id,type,model,complexity,query){
+  const up=document.getElementById('up-'+id),dn=document.getElementById('dn-'+id);if(!up||!dn)return;
+  if(type==='up'){up.classList.toggle('up-active');dn.classList.remove('down-active')}
+  else{dn.classList.toggle('down-active');up.classList.remove('up-active')}
+  // Send to backend
+  fetch('/feedback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:model||'',complexity:complexity||'simple',vote:type,query:query||''})}).catch(()=>{});
+}
+function typeText(el,text,speed){
+  let i=0;el.textContent='';
+  function t(){if(i<text.length){el.textContent+=text.charAt(i);i++;const chat=document.getElementById('chat');chat.scrollTop=chat.scrollHeight;setTimeout(t,speed)}};t();
+}
 function toggleDet(id){const el=document.getElementById('det-'+id);if(el)el.classList.toggle('open')}
 function togKey(k){const i=disabledKeys.indexOf(k);if(i>=0)disabledKeys.splice(i,1);else disabledKeys.push(k);localStorage.setItem('ng_disabled',JSON.stringify(disabledKeys));renderToggles()}
 function renderToggles(){KEYS.forEach(k=>{const b=document.getElementById('tog_'+k);if(!b)return;if(disabledKeys.includes(k)){b.className='ktog off';b.innerHTML='&#10007;'}else{b.className='ktog on';b.innerHTML='&#10003;'}})}
@@ -451,12 +471,17 @@ async function go(){
       det+='<div style="margin-top:4px;font-size:.65rem;color:var(--t3);white-space:pre-wrap">'+escHtml(d.routing_reason).split(' | ').join('\n')+'</div>';
       if(d.all_scores&&d.all_scores.length){det+='<div style="margin-top:4px">';d.all_scores.forEach(m=>{det+='<div class="dp-m'+(m.model_id===d.model?' sel':'')+'">'+m.display+'<span class="sc">'+m.goodness_score.toFixed(3)+'</span></div>'});det+='</div>'}
 
-      c.messages.push({user:q,ai:d.response,model:d.model_display||d.model,time:d.total_ms,cost:d.est_cost||0,cached:d.cached||false,details:det});
+      c.messages.push({user:q,ai:d.response,model:d.model_display||d.model,model_id:d.model||'',complexity:d.complexity?d.complexity.level:'simple',time:d.total_ms,cost:d.est_cost||0,cached:d.cached||false,details:det});
 
       if(d.learn_result&&d.learn_result.adjustments)showToast('Learning loop triggered','learn');
       if(d.cached)showToast('From cache - zero cost','cache');
     }
     saveAll();renderSidebar();renderChat();
+    // Typing animation on the last AI response
+    if(!d.blocked && !d.cached){
+      const bubbles=document.querySelectorAll('.ai-bubble');
+      if(bubbles.length){const last=bubbles[bubbles.length-1];const txt=last.textContent;typeText(last,txt,8)}
+    }
   }catch(e){alert('Error: '+e.message);const le=document.getElementById(lid);if(le)le.remove()}
   finally{b.disabled=false}
 }
