@@ -3,16 +3,17 @@
 import sys, os, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List
+import json as jsonlib
 
 from safety import inspect
 from router import route
 from validator import validate
-from executor import execute
+from executor import execute, execute_stream
 from learner import log, learn, get_learned_weights, get_recent, get_stats, save_feedback
 from config import MODELS
 import cache
@@ -159,6 +160,81 @@ class FeedbackReq(BaseModel):
 @app.post("/feedback")
 async def submit_feedback(req: FeedbackReq):
     return save_feedback(req.model, req.complexity, req.vote, req.query)
+
+
+@app.post("/route/stream")
+async def route_stream(req: Query):
+    """SSE streaming endpoint — streams LLM response word-by-word."""
+    active_keys = {k: v for k, v in req.api_keys.items() if k not in req.disabled_keys}
+    history_dicts = [{"user": h.user, "ai": h.ai} for h in req.history]
+
+    # Safety check (fast, no need to stream)
+    safety = inspect(req.query)
+    if safety["blocked"]:
+        async def blocked_gen():
+            yield f"data: {jsonlib.dumps({'blocked': True, 'block_reason': safety['block_reason'], 'safety': safety})}\n\n"
+        return StreamingResponse(blocked_gen(), media_type="text/event-stream")
+
+    # Cache check
+    if not req.history:
+        cached = cache.get(req.query)
+        if cached:
+            async def cache_gen():
+                yield f"data: {jsonlib.dumps({'cached': True, 'text': cached['text'], 'model_display': cached['model_display'], 'model': cached['model_used']})}\n\n"
+            return StreamingResponse(cache_gen(), media_type="text/event-stream")
+
+    # Route
+    force_free = budget.should_force_free()
+    learned = get_learned_weights()
+    if force_free:
+        free_keys = {k: v for k, v in active_keys.items() if any(MODELS[m]["free"] and MODELS[m]["key_name"] == k for m in MODELS)}
+        free_keys[""] = ""
+        decision = route(req.query, safety, available_keys=free_keys, learned_weights=learned)
+    else:
+        decision = route(req.query, safety, available_keys=active_keys, learned_weights=learned)
+
+    model_id = decision["selected_model"]
+    model_meta = MODELS.get(model_id, {})
+
+    async def stream_gen():
+        # Send routing info first
+        yield f"data: {jsonlib.dumps({'type': 'meta', 'model': model_id, 'model_display': decision.get('display', model_id), 'model_tier': decision['tier'], 'routing_reason': decision['routing_reason'], 'complexity': decision['complexity'], 'safety': safety, 'all_scores': decision['all_scores'], 'weights_used': decision['weights_used'], 'goodness_score': decision['goodness_score']})}\n\n"
+
+        # Stream the response
+        full_text = ""
+        start = time.time()
+        try:
+            async for chunk in execute_stream(model_id, req.query if not safety["pii_found"] else safety["safe_query"], active_keys, history=history_dicts):
+                full_text += chunk
+                yield f"data: {jsonlib.dumps({'type': 'chunk', 'text': chunk})}\n\n"
+        except Exception as e:
+            yield f"data: {jsonlib.dumps({'type': 'chunk', 'text': f'[Error: {str(e)[:80]}]'})}\n\n"
+
+        latency = round((time.time() - start) * 1000)
+        tokens = len(full_text.split())
+        est_cost = round(model_meta.get("cost", 0) * tokens / 1000, 6)
+        budget.add_cost(est_cost)
+
+        # Validate
+        val = validate(full_text, req.query)
+
+        # Cache if valid
+        if val["passed"] and not full_text.startswith("[") and not req.history:
+            cache.put(req.query, full_text, model_id, decision.get("display", ""))
+
+        # Log
+        log({"query": req.query[:100], "complexity": decision["complexity"]["level"], "complexity_score": decision["complexity"]["score"], "risk_score": safety["risk_score"], "model": model_id, "goodness_score": decision["goodness_score"], "latency_ms": latency, "tokens": tokens, "validation_passed": val["passed"], "toxicity_score": val["toxicity"]["score"], "hallucination_score": val["hallucination"]["score"], "used_fallback": False, "weights": decision["weights_used"]})
+
+        # Auto-learn
+        stats = get_stats()
+        learn_result = None
+        if stats["total"] >= 10 and stats["total"] % 10 == 0:
+            learn_result = learn()
+
+        # Send final summary
+        yield f"data: {jsonlib.dumps({'type': 'done', 'latency_ms': latency, 'tokens': tokens, 'est_cost': est_cost, 'validation': val, 'learn_result': learn_result, 'budget_status': budget.get_status(), 'cache_stats': cache.stats()})}\n\n"
+
+    return StreamingResponse(stream_gen(), media_type="text/event-stream")
 
 
 UI = r"""<!DOCTYPE html>
@@ -438,51 +514,109 @@ async function loadStats(){try{const r=await fetch('/stats');const d=await r.jso
 async function go(){
   const q=document.getElementById('q').value.trim();if(!q)return;
   const c=chats[currentChat];if(!c)return;
-
-  // Update title on first message
   if(!c.messages.length)c.title=q.slice(0,40)+(q.length>40?'...':'');
-
-  // Build history for API
   const history=c.messages.map(m=>({user:m.user,ai:m.ai}));
 
-  // Show user msg immediately
   const chat=document.getElementById('chat');
   const es=document.getElementById('emptyState');if(es)es.style.display='none';
   chat.innerHTML+='<div class="msg msg-user"><div class="bubble">'+escHtml(q)+'</div></div>';
-  const lid='ld-'+Date.now();
-  chat.innerHTML+='<div class="msg msg-ai" id="'+lid+'"><div class="ai-meta"><span class="ai-model"><span class="spin"></span> Routing...</span></div></div>';
+
+  // Create AI response placeholder
+  mc++;const mid='m-'+mc;
+  const aiDiv=document.createElement('div');aiDiv.className='msg msg-ai';aiDiv.id='ai-'+mid;
+  aiDiv.innerHTML='<div class="ai-meta"><span class="ai-model" id="meta-'+mid+'"><span class="spin"></span> Routing...</span><span class="ai-time" id="time-'+mid+'"></span><span class="ai-cost free" id="cost-'+mid+'"></span></div><div class="ai-bubble" id="bubble-'+mid+'"></div><div class="ai-actions" id="actions-'+mid+'" style="display:none"></div><div class="dpop" id="det-'+mid+'"></div>';
+  chat.appendChild(aiDiv);
   chat.scrollTop=chat.scrollHeight;
 
   document.getElementById('q').value='';autoResize(document.getElementById('q'));
   const b=document.getElementById('btn');b.disabled=true;
 
+  let fullText='',modelId='',modelDisplay='',modelTier='',complexity='simple',routingReason='',allScores=[],weightsUsed={},goodness=0,safety={};
+
   try{
-    const r=await fetch('/route',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q,api_keys:getKeys(),disabled_keys:disabledKeys,history:history})});
-    const d=await r.json();
-    const le=document.getElementById(lid);if(le)le.remove();
+    const r=await fetch('/route/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q,api_keys:getKeys(),disabled_keys:disabledKeys,history:history})});
+    const reader=r.body.getReader();
+    const decoder=new TextDecoder();
+    let buffer='';
 
-    if(d.blocked){
-      c.messages.push({user:q,ai:'[BLOCKED] '+d.block_reason,model:'Safety',time:d.total_ms,cost:0,cached:false,details:''});
-    } else {
-      queryCount++;totalCost+=(d.est_cost||0);if(d.cached)cacheHits++;updBadges();
+    while(true){
+      const{done,value}=await reader.read();
+      if(done)break;
+      buffer+=decoder.decode(value,{stream:true});
+      const lines=buffer.split('\n');
+      buffer=lines.pop()||'';
 
-      // Build details HTML
-      let det='<div class="pipe-mini">';(d.steps||[]).forEach(s=>{det+='<div class="ps"><div class="n">'+s.layer+'</div><div class="v">'+s.ms+'ms</div></div>'});det+='</div>';
-      det+='<div style="margin-top:4px;font-size:.65rem;color:var(--t3);white-space:pre-wrap">'+escHtml(d.routing_reason).split(' | ').join('\n')+'</div>';
-      if(d.all_scores&&d.all_scores.length){det+='<div style="margin-top:4px">';d.all_scores.forEach(m=>{det+='<div class="dp-m'+(m.model_id===d.model?' sel':'')+'">'+m.display+'<span class="sc">'+m.goodness_score.toFixed(3)+'</span></div>'});det+='</div>'}
+      for(const line of lines){
+        if(!line.startsWith('data: '))continue;
+        try{
+          const d=JSON.parse(line.slice(6));
 
-      c.messages.push({user:q,ai:d.response,model:d.model_display||d.model,model_id:d.model||'',complexity:d.complexity?d.complexity.level:'simple',time:d.total_ms,cost:d.est_cost||0,cached:d.cached||false,details:det});
+          // Blocked
+          if(d.blocked){
+            document.getElementById('bubble-'+mid).innerHTML='<div class="blocked">&#9940; '+escHtml(d.block_reason)+'</div>';
+            c.messages.push({user:q,ai:'[BLOCKED] '+d.block_reason,model:'Safety',time:0,cost:0,cached:false,details:''});
+            saveAll();renderSidebar();break;
+          }
 
-      if(d.learn_result&&d.learn_result.adjustments)showToast('Learning loop triggered','learn');
-      if(d.cached)showToast('From cache - zero cost','cache');
+          // Cache hit
+          if(d.cached){
+            fullText=d.text;modelDisplay=d.model_display;modelId=d.model;
+            document.getElementById('meta-'+mid).textContent=modelDisplay;
+            document.getElementById('bubble-'+mid).textContent=fullText;
+            document.getElementById('bubble-'+mid).classList.add('cache-hit');
+            document.getElementById('cost-'+mid).textContent='cached';
+            document.getElementById('cost-'+mid).className='ai-cost cached';
+            cacheHits++;updBadges();showToast('From cache - zero cost','cache');
+            c.messages.push({user:q,ai:fullText,model:modelDisplay,model_id:modelId,complexity:'cached',time:0,cost:0,cached:true,details:''});
+            saveAll();renderSidebar();break;
+          }
+
+          // Meta (routing info)
+          if(d.type==='meta'){
+            modelId=d.model;modelDisplay=d.model_display;modelTier=d.model_tier;
+            routingReason=d.routing_reason||'';allScores=d.all_scores||[];
+            weightsUsed=d.weights_used||{};goodness=d.goodness_score||0;
+            complexity=d.complexity?d.complexity.level:'simple';safety=d.safety||{};
+            document.getElementById('meta-'+mid).textContent=modelDisplay;
+          }
+
+          // Text chunk (REAL STREAMING)
+          if(d.type==='chunk'){
+            fullText+=d.text;
+            document.getElementById('bubble-'+mid).textContent=fullText;
+            chat.scrollTop=chat.scrollHeight;
+          }
+
+          // Done
+          if(d.type==='done'){
+            queryCount++;totalCost+=(d.est_cost||0);updBadges();
+            document.getElementById('time-'+mid).textContent=d.latency_ms+'ms '+d.tokens+' tok';
+            const costStr=d.est_cost>0?'$'+d.est_cost.toFixed(5):'free';
+            const costEl=document.getElementById('cost-'+mid);
+            costEl.textContent=costStr;costEl.className='ai-cost '+(d.est_cost>0?'paid':'free');
+
+            // Show actions
+            const actEl=document.getElementById('actions-'+mid);
+            actEl.style.display='flex';
+            actEl.innerHTML='<button class="thumb" id="up-'+mid+'" onclick="feedback(\''+mid+'\',\'up\',\''+escHtml(modelId)+'\',\''+escHtml(complexity)+'\',\''+escHtml(q).replace(/'/g,'')+'\')">&#128077;</button><button class="thumb" id="dn-'+mid+'" onclick="feedback(\''+mid+'\',\'down\',\''+escHtml(modelId)+'\',\''+escHtml(complexity)+'\',\''+escHtml(q).replace(/'/g,'')+'\')">&#128078;</button><button class="dbtn" onclick="toggleDet(\''+mid+'\')">Details</button>';
+
+            // Build details
+            let det='<div style="font-size:.65rem;color:var(--t3);white-space:pre-wrap">'+escHtml(routingReason).split(' | ').join('\n')+'</div>';
+            if(allScores.length){det+='<div style="margin-top:4px">';allScores.forEach(m=>{det+='<div class="dp-m'+(m.model_id===modelId?' sel':'')+'">'+m.display+'<span class="sc">'+m.goodness_score.toFixed(3)+'</span></div>'});det+='</div>'}
+            document.getElementById('det-'+mid).innerHTML=det;
+
+            c.messages.push({user:q,ai:fullText,model:modelDisplay,model_id:modelId,complexity:complexity,time:d.latency_ms,cost:d.est_cost||0,cached:false,details:det});
+            saveAll();renderSidebar();
+
+            if(d.learn_result&&d.learn_result.adjustments)showToast('Learning loop triggered','learn');
+            if(d.budget_status&&d.budget_status.force_free)showToast('Budget limit - free only','budget');
+          }
+        }catch(pe){}
+      }
     }
-    saveAll();renderSidebar();renderChat();
-    // Typing animation on the last AI response
-    if(!d.blocked && !d.cached){
-      const bubbles=document.querySelectorAll('.ai-bubble');
-      if(bubbles.length){const last=bubbles[bubbles.length-1];const txt=last.textContent;typeText(last,txt,8)}
-    }
-  }catch(e){alert('Error: '+e.message);const le=document.getElementById(lid);if(le)le.remove()}
+  }catch(e){
+    document.getElementById('bubble-'+mid).textContent='[Connection error: '+e.message+']';
+  }
   finally{b.disabled=false}
 }
 
