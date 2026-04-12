@@ -2,6 +2,8 @@
 
 An intelligent routing layer that sits between your application and multiple LLM providers. It decides which model to use for each request based on cost, quality, latency, and risk — then learns from outcomes to get smarter over time.
 
+🔗 **Live Demo:** [neuralgate.onrender.com](https://neuralgate.onrender.com)
+
 **18 models. 6 providers. 1 API.**
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue) ![FastAPI](https://img.shields.io/badge/FastAPI-0.115-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
